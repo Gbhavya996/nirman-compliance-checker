@@ -83,16 +83,24 @@ def _compare_mrp(label_val, listing_val) -> dict:
     try:
         lbl = float(label_val)
         lst = float(listing_val)
-        diff_pct = abs(lbl - lst) / max(lbl, lst) * 100
-        if diff_pct <= 2.0:
-            row["verdict"] = _VERDICT_MATCH
-            row["note"] = f"Both show ₹{lbl:.2f} (within 2% tolerance)."
-        else:
+        diff_pct = round(abs(lbl - lst) / max(lbl, lst) * 100, 1)
+        delta_rup = round(lst - lbl, 2)
+        row["delta_rupees"] = delta_rup
+        row["delta_str"] = f"+₹{delta_rup:.2f}" if delta_rup > 0 else f"-₹{abs(delta_rup):.2f}"
+        row["delta_pct"] = diff_pct
+
+        if lst > lbl + 0.05:
             row["verdict"] = _VERDICT_DISCREPANCY
             row["note"] = (
-                f"Label shows ₹{lbl:.2f} but listing shows ₹{lst:.2f} "
-                f"(difference: {diff_pct:.1f}%). May indicate price override or outdated label."
+                f"Online listing shows ₹{lst:.2f} but label MRP is ₹{lbl:.2f} "
+                f"(Delta: +₹{delta_rup:.2f} / +{diff_pct}%). Over-MRP violation under Section 18 / 36(1) LM-PC Rules."
             )
+        elif diff_pct <= 2.0:
+            row["verdict"] = _VERDICT_MATCH
+            row["note"] = f"Both show ₹{lbl:.2f} (compliant within 2% tolerance)."
+        else:
+            row["verdict"] = _VERDICT_MATCH
+            row["note"] = f"Listing price ₹{lst:.2f} is within package MRP ₹{lbl:.2f} (compliant sale)."
     except (TypeError, ValueError):
         row["verdict"] = _VERDICT_UNAVAILABLE
         row["note"] = "Could not parse MRP values for comparison."

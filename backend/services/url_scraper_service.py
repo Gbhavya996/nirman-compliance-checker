@@ -21,16 +21,23 @@ logger = logging.getLogger(__name__)
 # HTTP fetch helper with realistic browser headers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# HTTP fetch helper with realistic browser headers
+# ---------------------------------------------------------------------------
+
 _HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-IN,en-GB,en-US;q=0.9,en;q=0.8",
-    "DNT": "1",
-    "Upgrade-Insecure-Requests": "1",
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-IN,en-GB;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1',
 }
 
 BOT_BLOCK_ERROR = "This e-commerce site blocked automated access. Please upload a package image directly for compliance screening."
@@ -64,25 +71,85 @@ def _is_anti_bot(html: str, status_code: int) -> bool:
     return False
 
 
-def _fetch_html(url: str, timeout: int = 10) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+def _fetch_html_via_curl(url: str, timeout: int = 12) -> Tuple[Optional[str], Optional[int], Optional[str], str]:
+    """Fallback fetcher using Windows curl.exe to bypass TLS fingerprinting blocks on Amazon."""
+    import shutil
+    import subprocess
+
+    curl_bin = shutil.which("curl") or shutil.which("curl.exe")
+    if not curl_bin:
+        return None, None, "curl not available", url
+
+    try:
+        cmd = [
+            curl_bin, "-s", "-L",
+            "-A", _HEADERS['User-Agent'],
+            "-H", f"Accept: {_HEADERS['Accept']}",
+            "-H", f"Accept-Language: {_HEADERS['Accept-Language']}",
+            "-H", f"Sec-Ch-Ua: {_HEADERS['Sec-Ch-Ua']}",
+            "-H", f"Sec-Ch-Ua-Mobile: {_HEADERS['Sec-Ch-Ua-Mobile']}",
+            "-H", f"Sec-Ch-Ua-Platform: {_HEADERS['Sec-Ch-Ua-Platform']}",
+            "-H", f"Sec-Fetch-Dest: {_HEADERS['Sec-Fetch-Dest']}",
+            "-H", f"Sec-Fetch-Mode: {_HEADERS['Sec-Fetch-Mode']}",
+            "-H", f"Sec-Fetch-Site: {_HEADERS['Sec-Fetch-Site']}",
+            "-H", f"Sec-Fetch-User: {_HEADERS['Sec-Fetch-User']}",
+            "-H", f"Upgrade-Insecure-Requests: {_HEADERS['Upgrade-Insecure-Requests']}",
+            "--max-time", str(timeout),
+            "-w", "\n__FINAL_URL__:%{url_effective}",
+            url,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+        if res.returncode == 0 and res.stdout:
+            parts = res.stdout.rsplit("\n__FINAL_URL__:", 1)
+            curl_html = parts[0]
+            final_url = parts[1].strip() if len(parts) > 1 and parts[1].strip() else url
+            if not _is_anti_bot(curl_html, 200) and len(curl_html) > 5000:
+                logger.info("Successfully fetched %s via curl fallback (%d bytes)", url, len(curl_html))
+                return curl_html, 200, None, final_url
+            return curl_html, 200, BOT_BLOCK_ERROR if _is_anti_bot(curl_html, 200) else None, final_url
+    except Exception as exc:
+        logger.debug("curl fallback failed: %s", exc)
+
+    return None, None, "curl execution failed", url
+
+
+def _fetch_html(url: str, timeout: int = 10) -> Tuple[Optional[str], Optional[int], Optional[str], str]:
     """
-    Fetch URL. Returns (html_text, status_code, error_message).
+    Fetch URL with requests.Session() and allow_redirects=True (handles amzn.in and Amazon redirect links).
+    Returns (html_text, status_code, error_message, final_url).
     """
+    is_amazon = "amazon." in url.lower() or "amzn.in" in url.lower()
+
     try:
         import requests
         session = requests.Session()
-        resp = session.get(url, headers=_HEADERS, timeout=timeout, allow_redirects=True)
-        if _is_anti_bot(resp.text, resp.status_code):
-            return None, resp.status_code, BOT_BLOCK_ERROR
+        session.headers.update(_HEADERS)
 
-        if resp.status_code == 200:
-            return resp.text, 200, None
+        resp = session.get(url, timeout=timeout, allow_redirects=True)
+        final_url = resp.url
+        html_text = resp.text
+        status_code = resp.status_code
 
-        logger.warning("URL fetch returned HTTP %d for %s", resp.status_code, url)
-        return None, resp.status_code, f"Server returned HTTP {resp.status_code}."
+        # If requests got challenged by anti-bot on Amazon or returned small challenge stub
+        if _is_anti_bot(html_text, status_code) or (is_amazon and len(html_text) < 15000):
+            logger.info("requests.Session hit anti-bot challenge on %s (len: %d). Trying curl fallback...", url, len(html_text))
+            curl_html, curl_status, curl_err, curl_url = _fetch_html_via_curl(url, timeout=timeout)
+            if curl_html and not _is_anti_bot(curl_html, 200) and len(curl_html) > 5000:
+                return curl_html, 200, None, curl_url or final_url
+            # If curl also was challenged, return curl_html or resp.text for regex/meta fallback parsing
+            return curl_html or html_text, curl_status or status_code, BOT_BLOCK_ERROR, curl_url or final_url
+
+        if status_code == 200:
+            return html_text, 200, None, final_url
+
+        logger.warning("URL fetch returned HTTP %d for %s", status_code, url)
+        return html_text, status_code, f"Server returned HTTP {status_code}.", final_url
     except Exception as exc:
-        logger.warning("URL fetch failed for %s: %s", url, exc)
-        return None, None, f"Network connection failed: {exc}"
+        logger.warning("URL fetch via requests failed for %s: %s. Trying curl fallback...", url, exc)
+        curl_html, curl_status, curl_err, curl_url = _fetch_html_via_curl(url, timeout=timeout)
+        if curl_html:
+            return curl_html, curl_status or 200, curl_err, curl_url
+        return None, None, f"Network connection failed: {exc}", url
 
 
 def fetch_image_bytes(image_url: str, timeout: int = 10) -> Optional[Tuple[bytes, str]]:
@@ -169,12 +236,115 @@ def _extract_title(soup, text: str) -> Optional[str]:
     return None
 
 
-def _extract_mrp(soup, text: str) -> Optional[float]:
+def _extract_mrp(soup, text: str, html: str = "") -> Optional[float]:
     """
     Extract Price / MRP.
-    Checks: schema.org microdata (meta itemprop="price"), OpenGraph tags, or common price regex patterns (₹, Rs., INR).
+    Checks:
+      1. Regex search on entire HTML response: r'class="a-price-whole">([0-9,]+)'
+      2. Amazon specific selectors (span.a-price span.a-offscreen, div#corePriceDisplay, span.a-price-whole)
+      3. Secondary pattern: r'₹\s*([0-9,]+(?:\.[0-9]{2})?)'
+      4. JSON-LD metadata embedded in script tags (<script type="application/ld+json">) containing "price": "..."
+      5. Schema.org microdata meta itemprop="price"
+      6. Open Graph price meta tags
+      7. Common e-commerce CSS classes
+      8. Fallback regex patterns on text/html
+    Returns clean numeric float (e.g. 38.0).
     """
-    # 1. Schema.org microdata meta itemprop="price" or itemprop="price"
+    raw_html = html or (str(soup) if soup else "")
+
+    # 1. Regex search on entire HTML response: r'class="a-price-whole">([0-9,]+)'
+    if raw_html:
+        amz_whole_match = re.search(r'class="a-price-whole">([0-9,]+)', raw_html)
+        if amz_whole_match:
+            raw = amz_whole_match.group(1).replace(",", "").strip()
+            try:
+                val = float(raw)
+                if val > 0:
+                    return val
+            except ValueError:
+                pass
+
+    # 2. Amazon specific DOM selectors
+    # 2a. 'span.a-price span.a-offscreen'
+    amz_offscreen = soup.select_one("span.a-price span.a-offscreen")
+    if amz_offscreen:
+        raw = re.sub(r"[^\d.]", "", amz_offscreen.get_text(strip=True))
+        if raw:
+            try:
+                val = float(raw)
+                if val > 0:
+                    return val
+            except ValueError:
+                pass
+
+    # 2b. 'div#corePriceDisplay_desktop_feature_div span.a-price-whole'
+    amz_core = soup.select_one("div#corePriceDisplay_desktop_feature_div span.a-price-whole")
+    if amz_core:
+        raw = re.sub(r"[^\d.]", "", amz_core.get_text(strip=True))
+        if raw:
+            try:
+                val = float(raw)
+                if val > 0:
+                    return val
+            except ValueError:
+                pass
+
+    # 2c. 'span.a-price-whole'
+    amz_whole = soup.select_one("span.a-price-whole")
+    if amz_whole:
+        raw = re.sub(r"[^\d.]", "", amz_whole.get_text(strip=True))
+        if raw:
+            try:
+                val = float(raw)
+                if val > 0:
+                    return val
+            except ValueError:
+                pass
+
+    # 3. Secondary pattern: r'₹\s*([0-9,]+(?:\.[0-9]{2})?)'
+    rupee_pat = re.compile(r"₹\s*([0-9,]+(?:\.[0-9]{2})?)")
+    for src in [text, raw_html]:
+        if src:
+            m = rupee_pat.search(src)
+            if m:
+                try:
+                    val = float(m.group(1).replace(",", ""))
+                    if val > 0:
+                        return val
+                except ValueError:
+                    pass
+
+    # 4. JSON-LD metadata embedded in script tags (<script type="application/ld+json">) containing "price": "..."
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            content = tag.string or tag.get_text() or ""
+            if not content.strip():
+                continue
+            data = json.loads(content)
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            offers = data.get("offers", data.get("Offers", {}))
+            if isinstance(offers, list):
+                offers = offers[0] if offers else {}
+            price = offers.get("price") or offers.get("Price")
+            if price is not None:
+                val = float(str(price).replace(",", "").strip())
+                if val > 0:
+                    return val
+        except Exception:
+            pass
+
+    if raw_html:
+        json_price_match = re.search(r'"price"\s*:\s*"?([0-9,]+(?:\.[0-9]{2})?)"?', raw_html)
+        if json_price_match:
+            try:
+                val = float(json_price_match.group(1).replace(",", ""))
+                if val > 0:
+                    return val
+            except ValueError:
+                pass
+
+    # 5. Schema.org microdata meta itemprop="price" or itemprop="price"
     micro_price = soup.find("meta", attrs={"itemprop": "price"}) or soup.find(attrs={"itemprop": "price"})
     if micro_price:
         val = micro_price.get("content") or micro_price.get_text(strip=True)
@@ -182,38 +352,26 @@ def _extract_mrp(soup, text: str) -> Optional[float]:
             raw = re.sub(r"[^\d.]", "", str(val))
             if raw:
                 try:
-                    return float(raw)
+                    p = float(raw)
+                    if p > 0:
+                        return p
                 except ValueError:
                     pass
 
-    # 2. JSON-LD price
-    for tag in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(tag.string or "")
-            if isinstance(data, list):
-                data = data[0]
-            offers = data.get("offers", data.get("Offers", {}))
-            if isinstance(offers, list):
-                offers = offers[0]
-            price = offers.get("price") or offers.get("Price")
-            if price:
-                return float(str(price).replace(",", ""))
-        except Exception:
-            pass
-
-    # 3. Open Graph price
+    # 6. Open Graph price
     og_price = soup.find("meta", property="product:price:amount") or soup.find("meta", attrs={"name": "price"})
     if og_price and og_price.get("content"):
         try:
-            return float(og_price["content"].replace(",", ""))
+            p = float(og_price["content"].replace(",", ""))
+            if p > 0:
+                return p
         except ValueError:
             pass
 
-    # 4. Common CSS classes
+    # 7. Common CSS classes
     price_classes = [
         "price", "mrp", "selling-price", "sp", "offer-price",
-        "product-price", "Price", "finalPrice", "a-price-whole",
-        "pdp-price", "css-1vsd37c",
+        "product-price", "Price", "finalPrice", "pdp-price", "css-1vsd37c",
     ]
     for cls in price_classes:
         tag = soup.find(class_=re.compile(cls, re.I)) or soup.find(id=re.compile(cls, re.I))
@@ -221,13 +379,15 @@ def _extract_mrp(soup, text: str) -> Optional[float]:
             raw = re.sub(r"[^\d.]", "", tag.get_text())
             if raw:
                 try:
-                    return float(raw)
+                    p = float(raw)
+                    if p > 0:
+                        return p
                 except ValueError:
                     pass
 
-    # 5. Regex on raw text
+    # 8. Regex on raw text
     mrp_pat = re.compile(
-        r"(?:MRP|M\.R\.P\.?|Maximum\s+Retail\s+Price)[^₹Rs\d]*(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d{1,2})?)",
+        r"(?:MRP|M\.R\.P\.?|Maximum\s+Retail\s+Price)[^₹Rs\d]*(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.[0-9]{1,2})?)",
         re.IGNORECASE,
     )
     m = mrp_pat.search(text)
@@ -237,8 +397,8 @@ def _extract_mrp(soup, text: str) -> Optional[float]:
         except ValueError:
             pass
 
-    # 6. Any ₹ / Rs. / INR price pattern
-    price_pat = re.compile(r"(?:₹|Rs\.?|INR)[\s]*([\d,]+(?:\.\d{1,2})?)", re.IGNORECASE)
+    # 9. Any ₹ / Rs. / INR price pattern
+    price_pat = re.compile(r"(?:₹|Rs\.?|INR)[\s]*([\d,]+(?:\.[0-9]{1,2})?)", re.IGNORECASE)
     m = price_pat.search(text[:4000])
     if m:
         try:
@@ -434,13 +594,19 @@ def scrape_listing(url: str) -> dict:
         return base
 
     logger.info("Scraping listing URL: %s", url)
-    html, status_code, err = _fetch_html(url)
+    html, status_code, err, final_url = _fetch_html(url)
+    if final_url and final_url != url:
+        base["url"] = final_url
+        domain = _get_domain(final_url)
+        base["domain"] = domain
 
-    if html is None:
+    if not html:
         base["error"] = err or f"Could not fetch the page from {domain}."
         if err == BOT_BLOCK_ERROR or (err and "blocked" in err.lower()):
             base["blocked"] = True
         return base
+
+    is_blocked_status = (err == BOT_BLOCK_ERROR) or (status_code in (403, 429, 503))
 
     try:
         from bs4 import BeautifulSoup
@@ -449,18 +615,74 @@ def scrape_listing(url: str) -> dict:
 
         fields = {
             "product_title": _extract_title(soup, text),
-            "mrp": _extract_mrp(soup, text),
+            "mrp": _extract_mrp(soup, text, html=html),
             "net_quantity": _extract_quantity(soup, text),
             "manufacturer": _extract_brand(soup, text),
             "country_of_origin": _extract_country(soup, text),
-            "image_url": _extract_image_url(soup, url),
+            "image_url": _extract_image_url(soup, final_url or url),
         }
+
+        # Fallback price extraction on entire HTML if mrp is still None
+        if not fields["mrp"] and html:
+            m_amz = re.search(r'class="a-price-whole">([0-9,]+)', html)
+            if m_amz:
+                try:
+                    fields["mrp"] = float(m_amz.group(1).replace(",", "").strip())
+                except ValueError:
+                    pass
+            if not fields["mrp"]:
+                m_rupee = re.search(r'₹\s*([0-9,]+(?:\.[0-9]{2})?)', html)
+                if m_rupee:
+                    try:
+                        fields["mrp"] = float(m_rupee.group(1).replace(",", "").strip())
+                    except ValueError:
+                        pass
+            if not fields["mrp"]:
+                m_json = re.search(r'"price"\s*:\s*"?([0-9,]+(?:\.[0-9]{2})?)"?', html)
+                if m_json:
+                    try:
+                        fields["mrp"] = float(m_json.group(1).replace(",", "").strip())
+                    except ValueError:
+                        pass
+
+        # If blocked (403/503), parse meta tags (<meta property="og:description"> or title) as fallback
+        if is_blocked_status:
+            meta_desc = (
+                soup.find("meta", property="og:description") or
+                soup.find("meta", attrs={"name": "description"}) or
+                soup.find("meta", attrs={"name": "twitter:description"})
+            )
+            desc_content = meta_desc.get("content") if meta_desc else ""
+
+            # Fallback for title
+            if not fields["product_title"]:
+                title_tag = soup.find("title")
+                if title_tag and title_tag.get_text(strip=True):
+                    fields["product_title"] = title_tag.get_text(strip=True)
+
+            # Fallback for MRP from og:description or title
+            if not fields["mrp"] and desc_content:
+                m_price = re.search(r"₹\s*([0-9,]+(?:\.[0-9]{2})?)", desc_content) or re.search(r"(?:Rs\.?|INR)\s*([0-9,]+(?:\.[0-9]{2})?)", desc_content)
+                if m_price:
+                    try:
+                        fields["mrp"] = float(m_price.group(1).replace(",", ""))
+                    except ValueError:
+                        pass
+
+            # Fallback for quantity from og:description
+            if not fields["net_quantity"] and desc_content:
+                m_qty = re.search(r"(\d+(?:\.\d+)?)\s*(g|gm|gms|kg|ml|l)\b", desc_content, re.I)
+                if m_qty:
+                    fields["net_quantity"] = f"{m_qty.group(1)}{m_qty.group(2).lower()}"
 
         base.update(fields)
         base["page_text"] = text[:5000]
         base["scraped"] = any(v is not None for v in [fields["product_title"], fields["mrp"], fields["net_quantity"], fields["manufacturer"]])
 
-        if not base["scraped"]:
+        if not base["scraped"] and is_blocked_status:
+            base["blocked"] = True
+            base["error"] = BOT_BLOCK_ERROR
+        elif not base["scraped"]:
             base["error"] = (
                 f"Page was fetched from {domain} but product declarations could not be extracted. "
                 "The site layout may not be supported or requires JavaScript rendering."
@@ -473,5 +695,7 @@ def scrape_listing(url: str) -> dict:
     except Exception as exc:
         logger.error("Scraping parse error: %s", exc, exc_info=True)
         base["error"] = f"Parse error while extracting product info: {exc}"
+        if is_blocked_status:
+            base["blocked"] = True
 
     return base

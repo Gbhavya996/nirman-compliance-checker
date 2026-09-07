@@ -23,7 +23,7 @@ import base64
 import logging
 from io import BytesIO
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, send_file
 
 from services.ocr_service import run_ocr
 from services.extraction_service import extract_fields, extract_from_listing_and_text
@@ -33,6 +33,7 @@ from services.comparison_service import compare
 from services.url_scraper_service import scrape_listing, fetch_image_bytes
 from services.cross_verify_service import cross_verify
 from services.history_service import save_inspection, list_inspections, get_inspection, delete_all
+from services.notice_service import generate_enforcement_notice_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,11 @@ def analyze():
             ".bmp": "image/bmp",
         }.get(ext, "image/jpeg")
 
+    is_retail_sample = (
+        (request.form.get("is_retail_sample") or "").strip().lower() in ("true", "1", "yes") or
+        (request.form.get("sample_type") or "").strip().lower() == "retail_sample"
+    )
+
     try:
         # ─────────────────────────────────────────────────────────────────────
         # 1. URL-ONLY MODE
@@ -173,12 +179,13 @@ def analyze():
                     "explanation": "Font height verification skipped: high-resolution package font dimensions unavailable from web listing.",
                 }
 
-            # Price comparison
-            comparison = compare(extracted, listing)
+            # Price comparison with enforcement engine
+            comparison = compare(extracted, listing, is_retail_sample=is_retail_sample)
 
             response_body = {
                 "success": True,
                 "mode": "url",
+                "is_retail_sample": is_retail_sample,
                 "ocr": ocr_result,
                 "extracted": extracted,
                 "violations": violations,
@@ -216,10 +223,10 @@ def analyze():
             extracted = extract_fields(ocr_result["raw_text"])
             if listing.get("scraped"):
                 cross = cross_verify(extracted, listing)
-            comparison = compare(extracted, listing)
+            comparison = compare(extracted, listing, is_retail_sample=is_retail_sample)
         else:
             extracted = extract_fields(ocr_result["raw_text"])
-            comparison = compare(extracted)
+            comparison = compare(extracted, None, is_retail_sample=is_retail_sample)
 
         violations   = evaluate(extracted, ocr_result["raw_text"])
         rule_summary = summary(violations)
@@ -234,6 +241,7 @@ def analyze():
         response_body = {
             "success": True,
             "mode": mode,
+            "is_retail_sample": is_retail_sample,
             "ocr": {
                 "raw_text":   ocr_result["raw_text"],
                 "words":      ocr_result["words"],
@@ -293,6 +301,66 @@ def history_clear():
     if ok:
         return jsonify({"message": "History cleared."}), 200
     return jsonify({"error": "Failed to clear history."}), 500
+
+
+@inspections_bp.route("/generate-notice", methods=["POST"])
+def generate_notice():
+    """
+    Generate official Legal Metrology Statutory Enforcement Notice PDF.
+    Accepts JSON or multipart/form-data.
+    """
+    data = request.get_json(silent=True) or request.form.to_dict() or {}
+
+    case_type = (data.get("case_type") or "CASE_A").upper()
+    product_title = data.get("product_title") or "Packaged Commodity"
+
+    def _to_float(v):
+        if v is None:
+            return None
+        try:
+            return float(str(v).replace("₹", "").replace(",", "").strip())
+        except (ValueError, TypeError):
+            return None
+
+    physical_mrp = _to_float(data.get("physical_mrp"))
+    online_price = _to_float(data.get("online_price"))
+    delta_rupees = _to_float(data.get("delta_rupees"))
+    delta_pct = _to_float(data.get("delta_pct"))
+
+    domain_or_seller = data.get("domain_or_seller") or data.get("domain") or "E-Commerce Platform / Seller"
+    retailer_name = data.get("retailer_name") or "Retail Store Premise"
+    manufacturer = data.get("manufacturer") or ""
+    reference_no = data.get("reference_no")
+
+    try:
+        pdf_bytes = generate_enforcement_notice_pdf(
+            case_type=case_type,
+            product_title=product_title,
+            physical_mrp=physical_mrp,
+            online_price=online_price,
+            delta_rupees=delta_rupees,
+            delta_pct=delta_pct,
+            domain_or_seller=domain_or_seller,
+            retailer_name=retailer_name,
+            manufacturer=manufacturer,
+            reference_no=reference_no,
+        )
+
+        filename = (
+            "Platform_Show_Cause_Notice_Section_36.pdf"
+            if case_type == "CASE_A"
+            else "Retailer_Compound_Offence_Notice_Section_36.pdf"
+        )
+
+        return send_file(
+            BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=filename,
+        )
+    except Exception as exc:
+        logger.exception("Failed to generate notice PDF: %s", exc)
+        return jsonify({"error": "Failed to generate statutory notice PDF", "detail": str(exc)}), 500
 
 
 @inspections_bp.route("/health", methods=["GET"])

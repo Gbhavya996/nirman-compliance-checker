@@ -4,10 +4,13 @@ const API_BASE = '/api/inspections';
 
 // ── Status helpers ────────────────────────────────────────────────────────────
 const STATUS_META = {
-  PASS:    { label: 'PASS',    cls: 'pass',    icon: '✓' },
-  FAIL:    { label: 'FAIL',    cls: 'fail',    icon: '✗' },
-  WARNING: { label: 'WARN',    cls: 'warning', icon: '⚠' },
-  SKIP:    { label: 'SKIP',    cls: 'skip',    icon: '—' },
+  PASS:              { label: 'PASS',              cls: 'pass',    icon: '✓' },
+  VARIANT_COMPLIANT: { label: 'VARIANT COMPLIANT', cls: 'pass',    icon: '✓' },
+  FAIL:              { label: 'FAIL',              cls: 'fail',    icon: '✗' },
+  WARNING:           { label: 'WARN',              cls: 'warning', icon: '⚠' },
+  SKIP:              { label: 'SKIP',              cls: 'skip',    icon: '—' },
+  VARIANT_MISMATCH:  { label: 'VARIANT MISMATCH',  cls: 'warning', icon: '⚠' },
+  REVIEW_REQUIRED:   { label: 'REVIEW REQUIRED',   cls: 'warning', icon: '⚠' },
 };
 const OVERALL_META = {
   COMPLIANT:     { icon: '🛡️', label: 'Compliant',      cls: 'compliant' },
@@ -68,33 +71,221 @@ function ViolationCard({ item, index }) {
   );
 }
 
-function ComparisonTable({ comparison }) {
-  if (!comparison) return null;
-  const rows = [
-    ['Physical MRP (Label)', comparison.physical_mrp != null ? `₹ ${comparison.physical_mrp}` : '—'],
-    ['Online Price',         comparison.online_price != null ? `₹ ${comparison.online_price}` : '—'],
-    ['Delta',                comparison.delta_pct != null ? `${comparison.delta_pct > 0 ? '+' : ''}${comparison.delta_pct}%` : '—'],
-    ['Source',               comparison.source || '—'],
-    ['Status',               <StatusBadge key="s" status={comparison.status} />],
-  ];
-  return (
-    <div className="comparison-table-wrap">
-      <table className="comparison-table">
-        <thead><tr><th>Parameter</th><th>Value</th></tr></thead>
-        <tbody>
-          {rows.map(([param, val]) => (
-            <tr key={param}>
-              <td style={{ color: 'var(--clr-text-secondary)', fontWeight: 500 }}>{param}</td>
-              <td>{val}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      {comparison.explanation && (
-        <div style={{ padding: 'var(--sp-3) var(--sp-4)', fontSize: 'var(--text-xs)', color: 'var(--clr-text-muted)', borderTop: '1px solid var(--clr-border)' }}>
-          {comparison.explanation}
+function EnforcementActionCard({ activeEnf, onDownloadNotice, isDownloading }) {
+  if (!activeEnf) return null;
+
+  const isMismatch = activeEnf.status === 'VARIANT_MISMATCH' || activeEnf.status === 'REVIEW_REQUIRED';
+
+  if (isMismatch) {
+    return (
+      <div className="enforcement-card enforcement-card--warning">
+        <div className="enforcement-card__header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: '1.2rem' }}>⚠️</span>
+            <span className="enforcement-card__badge" style={{ background: 'rgba(230, 163, 32, 0.2)', borderColor: 'rgba(230, 163, 32, 0.4)', color: '#fde047' }}>
+              SKU / VARIANT MISMATCH · REVIEW REQUIRED
+            </span>
+          </div>
+          <span style={{ fontSize: 'var(--text-xs)', color: '#fde047', fontWeight: 600 }}>Rule 6(11) Protection</span>
         </div>
-      )}
+        <div className="enforcement-card__directive" style={{ color: 'var(--clr-warning)', marginBottom: 4 }}>
+          ⚠️ Variant Size / SKU Mismatch: Over-MRP violation suppressed to prevent false enforcement.
+        </div>
+        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--clr-text-secondary)', lineHeight: 1.5 }}>
+          {activeEnf.explanation || 'Physical sample size does not match the online listing size. Please link the identical SKU variant URL or verify Unit Sale Price.'}
+        </div>
+      </div>
+    );
+  }
+
+  const isViolation = activeEnf.is_violation;
+  const isCaseA = activeEnf.case === 'CASE_A';
+  const isCaseB = activeEnf.case === 'CASE_B';
+
+  if (!isViolation) {
+    return (
+      <div className="enforcement-card enforcement-card--pass">
+        <div className="enforcement-card__header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: '1.2rem' }}>🛡️</span>
+            <span className="enforcement-card__badge" style={{ background: 'rgba(34, 197, 94, 0.2)', borderColor: 'rgba(34, 197, 94, 0.4)', color: '#86efac' }}>
+              RULE 18 / 6(11) COMPLIANT · NO VIOLATION
+            </span>
+          </div>
+          <span style={{ fontSize: 'var(--text-xs)', color: '#86efac', fontWeight: 600 }}>LM-PC Rules 2011</span>
+        </div>
+        <div className="enforcement-card__directive" style={{ color: 'var(--clr-pass)', marginBottom: 4 }}>
+          ✓ Compliant Pricing: Selling price / unit sale rate does not exceed declared baseline.
+        </div>
+        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--clr-text-secondary)', lineHeight: 1.5 }}>
+          {activeEnf.explanation || 'No statutory overcharging, tampering, or dual-MRP infractions detected. No notice required.'}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="enforcement-card enforcement-card--violation">
+      <div className="enforcement-card__header">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: '1.3rem' }}>🚨</span>
+          <span className="enforcement-card__badge">
+            {isCaseB ? 'CASE B: OFFLINE FRAUD / TAMPERING' : 'CASE A: ONLINE FRAUD'}
+          </span>
+        </div>
+        <span style={{ fontSize: 'var(--text-xs)', color: '#fecdd3', fontWeight: 600 }}>
+          {isCaseB ? 'Section 36 LM Act, 2009' : 'Section 18 & 36(1) LM-PC Rules'}
+        </span>
+      </div>
+
+      <div className="enforcement-card__directive">
+        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--clr-text-muted)', marginBottom: 2 }}>MANDATORY DIRECTIVE:</div>
+        {activeEnf.action || (isCaseB
+          ? 'Issue Compounding Penalty Notice (₹25,000 to ₹1,00,000) against Retail Store for Price Smudging / Dual MRP.'
+          : 'Generate Statutory Notice to E-Commerce Platform / Seller under Rule 6(10) / 6(11) & Section 36.'
+        )}
+      </div>
+
+      <div className="enforcement-card__penalty">
+        <span style={{ fontSize: '1.1rem' }}>⚖️</span>
+        <div>
+          <strong style={{ color: 'var(--clr-amber-300)' }}>Statutory Penalty Bracket: </strong>
+          {activeEnf.penalty_bracket || (isCaseB
+            ? 'Section 36 fine of ₹25,000 to ₹1,00,000 against Retail Store for Price Smudging / Dual MRP'
+            : 'Section 36 fine of ₹25,000 for first offence, up to ₹50,000 for second offence & Rule 6(10) show-cause')}
+        </div>
+      </div>
+
+      <div className="enforcement-card__actions">
+        {isCaseB ? (
+          <button
+            id="generate-retailer-notice-btn"
+            className="btn-notice-download btn-notice-download--case-b"
+            onClick={() => onDownloadNotice('CASE_B')}
+            disabled={isDownloading}
+          >
+            {isDownloading ? 'Generating Notice…' : '⚖️ Generate Retailer Compound Offence Notice'}
+          </button>
+        ) : (
+          <button
+            id="download-platform-notice-btn"
+            className="btn-notice-download btn-notice-download--case-a"
+            onClick={() => onDownloadNotice('CASE_A')}
+            disabled={isDownloading}
+          >
+            {isDownloading ? 'Generating Notice…' : '📄 Download Platform Show-Cause Notice (PDF)'}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ComparisonTable({ comparison, isRetailSample, onToggleRetailSample, onDownloadNotice, isDownloading }) {
+  if (!comparison) return null;
+
+  const activeEnf = (isRetailSample ? comparison.cases?.case_b : comparison.cases?.case_a) || comparison;
+  const p_mrp = comparison.physical_mrp;
+  const o_price = comparison.online_price;
+
+  const isMismatch = activeEnf.status === 'VARIANT_MISMATCH' || activeEnf.status === 'REVIEW_REQUIRED';
+  const deltaColor = isMismatch
+    ? 'var(--clr-warning)'
+    : activeEnf.is_violation ? 'var(--clr-fail)' : 'var(--clr-pass)';
+  const verdictClass = isMismatch
+    ? 'warning'
+    : activeEnf.is_violation ? 'violation' : 'pass';
+
+  const deltaDisplay = activeEnf.delta_str || (
+    comparison.delta_pct != null
+      ? `${comparison.delta_pct > 0 ? '+' : ''}${comparison.delta_pct}%`
+      : '—'
+  );
+
+  let uspDisplay = '—';
+  if (comparison.usp_comparison) {
+    uspDisplay = comparison.usp_comparison;
+  } else if (comparison.physical_usp != null && comparison.online_usp != null && comparison.usp_unit) {
+    uspDisplay = `₹${Number(comparison.physical_usp).toFixed(2)}/${comparison.usp_unit} vs ₹${Number(comparison.online_usp).toFixed(2)}/${comparison.usp_unit}`;
+  }
+
+  const physUspDisplay = comparison.physical_usp_display || (
+    comparison.physical_usp != null
+      ? (typeof comparison.physical_usp === 'string'
+          ? comparison.physical_usp
+          : `₹ ${Number(comparison.physical_usp).toFixed(comparison.physical_usp < 1 ? 2 : 2)} / ${comparison.usp_unit || 'g'}`)
+      : null
+  );
+
+  const onlUspDisplay = comparison.online_usp_display || (
+    comparison.online_usp != null
+      ? (typeof comparison.online_usp === 'string'
+          ? comparison.online_usp
+          : `₹ ${Number(comparison.online_usp).toFixed(comparison.online_usp < 1 ? 3 : 2)} / ${comparison.usp_unit || 'g'}`)
+      : null
+  );
+
+  const rows = [
+    ['Physical MRP (Label)',        p_mrp != null ? (comparison.physical_mrp_display || `₹ ${Number(p_mrp).toFixed(2)}`) : '—'],
+    ['Online Price',                o_price != null ? (comparison.online_price_display || `₹ ${Number(o_price).toFixed(2)}`) : '—'],
+    ['Physical Net Quantity',       comparison.physical_quantity || '—'],
+    ['Online Net Quantity',         comparison.online_quantity || '—'],
+    ...(physUspDisplay ? [['Physical USP', physUspDisplay]] : []),
+    ...(onlUspDisplay ? [['Online USP', onlUspDisplay]] : []),
+    ['Normalized Unit Price (USP)', uspDisplay],
+    ['Delta',                       <span key="d" style={{ color: deltaColor, fontWeight: 700, fontFamily: 'var(--font-mono)' }}>{deltaDisplay}</span>],
+    ['Regulatory Finding',          <span key="v" className={`verdict-tag verdict-tag--${verdictClass}`}>{activeEnf.verdict || (comparison.status === 'PASS' ? 'PASS - Compliant with Rule 18' : 'Under Review')}</span>],
+    ['Source',                      comparison.source || '—'],
+    ['Status',                      <StatusBadge key="s" status={activeEnf.status || comparison.status} />],
+  ];
+
+  return (
+    <div className="comparison-wrap">
+      {/* Sample Context Toggle */}
+      <div className="sample-context-bar">
+        <div className="sample-context-info">
+          <div className="sample-context-title">Inspection Sample Mode</div>
+          <div className="sample-context-desc">
+            Toggle mode if sample was acquired from an offline retail shop to test for price tampering (Case B) vs e-commerce over-MRP (Case A).
+          </div>
+        </div>
+        <label className={`retail-toggle-label ${isRetailSample ? 'retail-toggle-label--active' : ''}`}>
+          <input
+            id="comparison-retail-toggle"
+            type="checkbox"
+            checked={Boolean(isRetailSample)}
+            onChange={(e) => onToggleRetailSample(e.target.checked)}
+          />
+          <span className="retail-toggle-text">
+            {isRetailSample ? '🏪 Retail Store Physical Sample' : '🌐 Standard Online Inspection'}
+          </span>
+        </label>
+      </div>
+
+      <div className="comparison-table-wrap">
+        <table className="comparison-table">
+          <thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+          <tbody>
+            {rows.map(([param, val]) => (
+              <tr key={param}>
+                <td style={{ color: 'var(--clr-text-secondary)', fontWeight: 500 }}>{param}</td>
+                <td>{val}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {(activeEnf.explanation || comparison.explanation) && (
+          <div style={{ padding: 'var(--sp-3) var(--sp-4)', fontSize: 'var(--text-xs)', color: 'var(--clr-text-muted)', borderTop: '1px solid var(--clr-border)' }}>
+            {activeEnf.explanation || comparison.explanation}
+          </div>
+        )}
+      </div>
+
+      <EnforcementActionCard
+        activeEnf={activeEnf}
+        onDownloadNotice={onDownloadNotice}
+        isDownloading={isDownloading}
+      />
     </div>
   );
 }
@@ -127,8 +318,10 @@ const VERDICT_META = {
   'UNAVAILABLE':                              { icon: '—',  cls: 'skip' },
 };
 
-function CrossVerifyPanel({ cross }) {
+function CrossVerifyPanel({ cross, comparison, isRetailSample, onToggleRetailSample, onDownloadNotice, isDownloading }) {
   if (!cross) return null;
+
+  const activeEnf = (isRetailSample ? comparison?.cases?.case_b : comparison?.cases?.case_a) || comparison;
 
   if (!cross.scraped) {
     return (
@@ -157,7 +350,30 @@ function CrossVerifyPanel({ cross }) {
         </div>
       )}
 
-      <div className={`cross-overall cross-overall--${overallMeta.cls}`}>
+      {/* Sample Context Toggle */}
+      {comparison && (
+        <div className="sample-context-bar" style={{ marginTop: 'var(--sp-3)' }}>
+          <div className="sample-context-info">
+            <div className="sample-context-title">Inspection Sample Mode</div>
+            <div className="sample-context-desc">
+              Toggle to test Retail Store Sample (Case B) vs E-Commerce Listing (Case A).
+            </div>
+          </div>
+          <label className={`retail-toggle-label ${isRetailSample ? 'retail-toggle-label--active' : ''}`}>
+            <input
+              id="cross-retail-toggle"
+              type="checkbox"
+              checked={Boolean(isRetailSample)}
+              onChange={(e) => onToggleRetailSample(e.target.checked)}
+            />
+            <span className="retail-toggle-text">
+              {isRetailSample ? '🏪 Retail Store Physical Sample' : '🌐 Standard Online Inspection'}
+            </span>
+          </label>
+        </div>
+      )}
+
+      <div className={`cross-overall cross-overall--${overallMeta.cls}`} style={{ marginTop: 'var(--sp-3)' }}>
         <span style={{ fontSize: '1.2rem' }}>{overallMeta.icon}</span>
         {overallMeta.label}
       </div>
@@ -169,12 +385,14 @@ function CrossVerifyPanel({ cross }) {
               <th>Field</th>
               <th>Label (OCR)</th>
               <th>Online Listing</th>
+              <th>Delta / Finding</th>
               <th>Verdict</th>
             </tr>
           </thead>
           <tbody>
             {(cross.rows || []).map((row) => {
               const vm = VERDICT_META[row.verdict] || VERDICT_META['UNAVAILABLE'];
+              const isMRP = row.field === 'MRP';
               return (
                 <tr key={row.field}>
                   <td style={{ fontWeight: 600, color: 'var(--clr-text-secondary)' }}>{row.field}</td>
@@ -184,9 +402,16 @@ function CrossVerifyPanel({ cross }) {
                   <td style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)' }}>
                     {row.listing_value ?? <em style={{ color: 'var(--clr-text-muted)' }}>—</em>}
                   </td>
+                  <td style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)' }}>
+                    {isMRP && activeEnf?.delta_str ? (
+                      <span style={{ color: activeEnf.is_violation ? 'var(--clr-fail)' : 'var(--clr-pass)', fontWeight: 700 }}>
+                        {activeEnf.delta_str}
+                      </span>
+                    ) : (row.delta_str || '—')}
+                  </td>
                   <td>
                     <span className={`cross-verdict cross-verdict--${vm.cls}`}>
-                      {vm.icon} {row.verdict}
+                      {vm.icon} {isMRP && activeEnf ? (activeEnf.is_violation ? 'VIOLATION' : 'MATCH') : row.verdict}
                     </span>
                   </td>
                 </tr>
@@ -204,6 +429,14 @@ function CrossVerifyPanel({ cross }) {
           </div>
         )}
       </div>
+
+      {comparison && (
+        <EnforcementActionCard
+          activeEnf={activeEnf}
+          onDownloadNotice={onDownloadNotice}
+          isDownloading={isDownloading}
+        />
+      )}
     </div>
   );
 }
@@ -306,6 +539,7 @@ export default function InspectionDetails() {
   const [file, setFile]           = useState(null);
   const [preview, setPreview]     = useState(null);
   const [productUrl, setProductUrl] = useState('');
+  const [isRetailSample, setIsRetailSample] = useState(false);
   const [dragging, setDragging]   = useState(false);
 
   // Process state
@@ -314,6 +548,7 @@ export default function InspectionDetails() {
   const [result, setResult]       = useState(null);
   const [error, setError]         = useState(null);
   const [activeTab, setActiveTab] = useState('violations');
+  const [downloadingNotice, setDownloadingNotice] = useState(false);
 
   // History
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -341,6 +576,7 @@ export default function InspectionDetails() {
     setFile(null);
     setPreview(null);
     setProductUrl('');
+    setIsRetailSample(false);
     setResult(null);
     setError(null);
     setProgress(0);
@@ -378,6 +614,52 @@ export default function InspectionDetails() {
     (!needsImage || !!file) &&
     (!needsUrl   || productUrl.trim().startsWith('http'));
 
+  // ── Statutory Notice Download ────────────────────────────────────────────────
+  const handleDownloadNotice = async (caseType) => {
+    setDownloadingNotice(true);
+    try {
+      const activeEnf = (isRetailSample ? result?.comparison?.cases?.case_b : result?.comparison?.cases?.case_a) || result?.comparison;
+      const targetCase = caseType || activeEnf?.case || (isRetailSample ? 'CASE_B' : 'CASE_A');
+      const payload = {
+        case_type: targetCase,
+        product_title: result?.listing?.product_title || result?.extracted?.manufacturer?.value || 'Packaged Commodity Sample',
+        physical_mrp: result?.comparison?.physical_mrp,
+        online_price: result?.comparison?.online_price,
+        delta_rupees: activeEnf?.delta_rupees ?? result?.comparison?.delta_rupees,
+        delta_pct: activeEnf?.delta_pct ?? result?.comparison?.delta_pct,
+        domain_or_seller: result?.listing?.domain || result?.comparison?.source || 'E-Commerce Platform',
+        retailer_name: 'Retail Store Premise',
+        manufacturer: result?.extracted?.manufacturer?.value || '',
+      };
+
+      const resp = await fetch('/api/inspections/generate-notice', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      if (!resp.ok) {
+        throw new Error(`Server returned HTTP ${resp.status}`);
+      }
+
+      const blob = await resp.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = targetCase === 'CASE_A'
+        ? 'Platform_Show_Cause_Notice_Section_36.pdf'
+        : 'Retailer_Compound_Offence_Notice_Section_36.pdf';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(blobUrl);
+    } catch (err) {
+      alert(`Error generating statutory notice: ${err.message}`);
+    } finally {
+      setDownloadingNotice(false);
+    }
+  };
+
   // ── Analysis ────────────────────────────────────────────────────────────────
   const analyze = async () => {
     if (!canSubmit) return;
@@ -394,6 +676,7 @@ export default function InspectionDetails() {
     try {
       const form = new FormData();
       form.append('mode', mode);
+      form.append('is_retail_sample', isRetailSample ? 'true' : 'false');
       if ((mode === 'image' || mode === 'both') && file) {
         form.append('image', file);
       }
@@ -412,6 +695,9 @@ export default function InspectionDetails() {
       } else {
         setError(null);
         setResult(json);
+        if (json.is_retail_sample != null) {
+          setIsRetailSample(Boolean(json.is_retail_sample));
+        }
         // Auto-select cross-verification tab when both modes used
         if (json.mode === 'both' && json.cross_verification?.scraped) {
           setActiveTab('crossverify');
@@ -428,6 +714,9 @@ export default function InspectionDetails() {
   // Load a history record directly
   const loadHistoryRecord = (rec) => {
     setResult(rec);
+    if (rec.is_retail_sample != null) {
+      setIsRetailSample(Boolean(rec.is_retail_sample));
+    }
     setActiveTab('violations');
     setPreview(rec.image_b64 && rec.image_mime
       ? `data:${rec.image_mime};base64,${rec.image_b64}` : null);
@@ -542,6 +831,25 @@ export default function InspectionDetails() {
               )}
             </div>
           )}
+
+          {/* Retail Store Physical Sample Mode Toggle */}
+          <div className="sample-context-bar" style={{ marginTop: 'var(--sp-3)', background: 'rgba(30, 41, 59, 0.45)' }}>
+            <div className="sample-context-info">
+              <div className="sample-context-title">Sample Context</div>
+              <div className="sample-context-desc">
+                Flag if this sample is from an offline retail shop to test for price tampering / dual MRP (Case B).
+              </div>
+            </div>
+            <label className={`retail-toggle-label ${isRetailSample ? 'retail-toggle-label--active' : ''}`}>
+              <input
+                id="form-retail-sample-checkbox"
+                type="checkbox"
+                checked={isRetailSample}
+                onChange={(e) => setIsRetailSample(e.target.checked)}
+              />
+              <span className="retail-toggle-text">{isRetailSample ? '🏪 Retail Store Physical Sample' : '🌐 Standard Online Inspection'}</span>
+            </label>
+          </div>
 
           {/* Action buttons */}
           <div style={{ display: 'flex', gap: 'var(--sp-3)', alignItems: 'center', marginTop: 'var(--sp-4)', justifyContent: 'center' }}>
@@ -725,7 +1033,13 @@ export default function InspectionDetails() {
               {activeTab === 'comparison' && (
                 <div>
                   <SectionTitle icon="💰">Online vs. Physical Price</SectionTitle>
-                  <ComparisonTable comparison={result.comparison} />
+                  <ComparisonTable
+                    comparison={result.comparison}
+                    isRetailSample={isRetailSample}
+                    onToggleRetailSample={setIsRetailSample}
+                    onDownloadNotice={handleDownloadNotice}
+                    isDownloading={downloadingNotice}
+                  />
                 </div>
               )}
 
@@ -755,7 +1069,14 @@ export default function InspectionDetails() {
               {activeTab === 'crossverify' && (
                 <div>
                   <SectionTitle icon="🔀">Online Listing vs. Package</SectionTitle>
-                  <CrossVerifyPanel cross={result.cross_verification} />
+                  <CrossVerifyPanel
+                    cross={result.cross_verification}
+                    comparison={result.comparison}
+                    isRetailSample={isRetailSample}
+                    onToggleRetailSample={setIsRetailSample}
+                    onDownloadNotice={handleDownloadNotice}
+                    isDownloading={downloadingNotice}
+                  />
                 </div>
               )}
             </div>
