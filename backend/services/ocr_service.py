@@ -106,9 +106,12 @@ def _to_numpy(image_input) -> np.ndarray:
 def preprocess(image_input) -> np.ndarray:
     """
     Preprocessing pipeline tuned for printed product labels:
-    1. Convert to grayscale
+    1. Grayscale channel extraction:
+       Olive or low-contrast text against yellow packaging has highest contrast
+       in green or blue channel. Extracts channel with highest contrast rather than standard cv2.cvtColor.
     2. Upscale small images (OCR accuracy degrades below ~300 DPI)
-    3. CLAHE contrast enhancement
+    3. CLAHE contrast enhancement (clipLimit=3.0, tileGridSize=(8, 8)) before thresholding
+       to boost faint dot-matrix inkjet characters.
     4. Adaptive thresholding (handles uneven lighting / shadows)
     5. Mild morphological cleanup
     """
@@ -116,7 +119,20 @@ def preprocess(image_input) -> np.ndarray:
     if img is None:
         raise ValueError("Could not decode image – unsupported format or corrupt data.")
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Channel extraction: olive text on bright yellow packaging has highest contrast in green or blue channel
+    if len(img.shape) == 3 and img.shape[2] == 3:
+        b, g, r = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+        std_g = float(g.std())
+        std_b = float(b.std())
+        std_gray = float(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).std())
+        mean_b, mean_g, mean_r = float(b.mean()), float(g.mean()), float(r.mean())
+        is_yellow = mean_r > 80 and mean_g > 80 and (mean_r + mean_g) > 1.8 * (mean_b + 1)
+        if is_yellow or std_g > std_gray or std_b > std_gray:
+            gray = g if std_g >= std_b else b
+        else:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img if len(img.shape) == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # Upscale if too small
     h, w = gray.shape
@@ -124,8 +140,8 @@ def preprocess(image_input) -> np.ndarray:
         scale = 1200 / max(h, w)
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-    # CLAHE
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    # CLAHE (clipLimit=3.0, tileGridSize=(8, 8)) before thresholding
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
 
     # Adaptive threshold
@@ -195,7 +211,7 @@ def _run_tesseract(processed: np.ndarray, lang: str) -> dict:
 
 
 def _run_easyocr(image_input) -> dict:
-    """Run EasyOCR on the original (colour) image for best accuracy."""
+    """Run EasyOCR with CLAHE contrast enhancement for faint dot-matrix / inkjet text."""
     reader = _get_easyocr()
     if reader is None:
         raise RuntimeError("EasyOCR reader could not be initialised.")
@@ -204,8 +220,20 @@ def _run_easyocr(image_input) -> dict:
     if img_bgr is None:
         raise ValueError("Could not decode image for EasyOCR.")
 
+    # Enhance contrast using CLAHE (clipLimit=3.0, tileGridSize=(8,8))
+    # In LAB color space, applying CLAHE to L channel boosts faint inkjet text
+    # (like olive text on yellow packaging) without altering color hues
+    try:
+        lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l_clahe = clahe.apply(l)
+        enhanced_bgr = cv2.cvtColor(cv2.merge((l_clahe, a, b)), cv2.COLOR_LAB2BGR)
+    except Exception:
+        enhanced_bgr = img_bgr
+
     # EasyOCR accepts BGR ndarray directly
-    results = reader.readtext(img_bgr, detail=1, paragraph=False)
+    results = reader.readtext(enhanced_bgr, detail=1, paragraph=False)
 
     words = []
     lines_text = []

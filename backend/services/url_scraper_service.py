@@ -236,70 +236,109 @@ def _extract_title(soup, text: str) -> Optional[str]:
     return None
 
 
+def _is_inside_ignored_offer_box(element) -> bool:
+    """
+    Check if an element resides inside an inactive buybox, sidebar, or alternate offer card.
+    Specifically ignores #pinned-deactivated-buybox, #alternate-buybox, and alternate offers.
+    """
+    if not element:
+        return False
+    curr = element
+    ignored_tokens = (
+        "pinned-deactivated-buybox",
+        "alternate-buybox",
+        "dynamic-aod-ingress-box",
+        "all-offers-display",
+        "aod-alternate-offer",
+        "desktop-dp-sims",
+        "a-carousel",
+    )
+    while curr:
+        if hasattr(curr, "get"):
+            c_id = str(curr.get("id") or "")
+            c_class = " ".join(curr.get("class") or [])
+            combined = f"{c_id} {c_class}".lower()
+            if any(tok in combined for tok in ignored_tokens):
+                return True
+        curr = curr.parent
+    return False
+
+
 def _extract_mrp(soup, text: str, html: str = "") -> Optional[float]:
     """
     Extract Price / MRP.
-    Checks:
-      1. Regex search on entire HTML response: r'class="a-price-whole">([0-9,]+)'
-      2. Amazon specific selectors (span.a-price span.a-offscreen, div#corePriceDisplay, span.a-price-whole)
-      3. Secondary pattern: r'₹\s*([0-9,]+(?:\.[0-9]{2})?)'
-      4. JSON-LD metadata embedded in script tags (<script type="application/ld+json">) containing "price": "..."
-      5. Schema.org microdata meta itemprop="price"
-      6. Open Graph price meta tags
-      7. Common e-commerce CSS classes
-      8. Fallback regex patterns on text/html
-    Returns clean numeric float (e.g. 38.0).
+    Prioritizes the primary active Buybox price:
+      1. Primary active apex price container: span.apexPriceToPay span.a-offscreen
+      2. Primary core price container: #corePriceDisplay_desktop_feature_div span.a-price-whole
+      3. Desktop core price feature: #corePrice_desktop span.apexPriceToPay span.a-offscreen
+      4. Standard buybox priceblock IDs (#priceblock_ourprice, #priceblock_dealprice)
+      5. Filtered span.a-price span.a-offscreen (ignoring alternate / deactivated offer cards)
+      6. JSON-LD metadata, Schema.org microdata, Open Graph tags
+      7. Fallback regex on text/html
+    Ignores sidebar and alternate offer boxes (e.g. #pinned-deactivated-buybox).
     """
     raw_html = html or (str(soup) if soup else "")
 
-    # 1. Regex search on entire HTML response: r'class="a-price-whole">([0-9,]+)'
-    if raw_html:
-        amz_whole_match = re.search(r'class="a-price-whole">([0-9,]+)', raw_html)
-        if amz_whole_match:
-            raw = amz_whole_match.group(1).replace(",", "").strip()
-            try:
-                val = float(raw)
-                if val > 0:
-                    return val
-            except ValueError:
-                pass
+    if soup:
+        # 1. Target ONLY the primary active price container: span.apexPriceToPay span.a-offscreen
+        for apex in soup.select("span.apexPriceToPay span.a-offscreen"):
+            if not _is_inside_ignored_offer_box(apex):
+                raw = re.sub(r"[^\d.]", "", apex.get_text(strip=True))
+                if raw:
+                    try:
+                        val = float(raw)
+                        if val > 0:
+                            return val
+                    except ValueError:
+                        pass
 
-    # 2. Amazon specific DOM selectors
-    # 2a. 'span.a-price span.a-offscreen'
-    amz_offscreen = soup.select_one("span.a-price span.a-offscreen")
-    if amz_offscreen:
-        raw = re.sub(r"[^\d.]", "", amz_offscreen.get_text(strip=True))
-        if raw:
-            try:
-                val = float(raw)
-                if val > 0:
-                    return val
-            except ValueError:
-                pass
+        # 2. Target core active price: #corePriceDisplay_desktop_feature_div span.a-price-whole
+        for core in soup.select("#corePriceDisplay_desktop_feature_div span.a-price-whole"):
+            if not _is_inside_ignored_offer_box(core):
+                raw = re.sub(r"[^\d.]", "", core.get_text(strip=True))
+                if raw:
+                    try:
+                        val = float(raw)
+                        if val > 0:
+                            return val
+                    except ValueError:
+                        pass
 
-    # 2b. 'div#corePriceDisplay_desktop_feature_div span.a-price-whole'
-    amz_core = soup.select_one("div#corePriceDisplay_desktop_feature_div span.a-price-whole")
-    if amz_core:
-        raw = re.sub(r"[^\d.]", "", amz_core.get_text(strip=True))
-        if raw:
-            try:
-                val = float(raw)
-                if val > 0:
-                    return val
-            except ValueError:
-                pass
+        # 3. Target #corePrice_desktop active containers
+        for core_d in soup.select("#corePrice_desktop span.apexPriceToPay span.a-offscreen, #corePrice_desktop span.a-price-whole"):
+            if not _is_inside_ignored_offer_box(core_d):
+                raw = re.sub(r"[^\d.]", "", core_d.get_text(strip=True))
+                if raw:
+                    try:
+                        val = float(raw)
+                        if val > 0:
+                            return val
+                    except ValueError:
+                        pass
 
-    # 2c. 'span.a-price-whole'
-    amz_whole = soup.select_one("span.a-price-whole")
-    if amz_whole:
-        raw = re.sub(r"[^\d.]", "", amz_whole.get_text(strip=True))
-        if raw:
-            try:
-                val = float(raw)
-                if val > 0:
-                    return val
-            except ValueError:
-                pass
+        # 4. Standard buybox price blocks
+        for bb in soup.select("#priceblock_ourprice, #priceblock_dealprice, #priceblock_saleprice"):
+            if not _is_inside_ignored_offer_box(bb):
+                raw = re.sub(r"[^\d.]", "", bb.get_text(strip=True))
+                if raw:
+                    try:
+                        val = float(raw)
+                        if val > 0:
+                            return val
+                    except ValueError:
+                        pass
+
+        # 5. General span.a-price span.a-offscreen (strictly filtered against inactive/alternate cards)
+        for off in soup.select("span.a-price span.a-offscreen"):
+            if not _is_inside_ignored_offer_box(off):
+                raw = re.sub(r"[^\d.]", "", off.get_text(strip=True))
+                if raw:
+                    try:
+                        val = float(raw)
+                        if val > 0:
+                            return val
+                    except ValueError:
+                        pass
 
     # 3. Secondary pattern: r'₹\s*([0-9,]+(?:\.[0-9]{2})?)'
     rupee_pat = re.compile(r"₹\s*([0-9,]+(?:\.[0-9]{2})?)")
@@ -510,6 +549,42 @@ def _extract_country(soup, text: str) -> Optional[str]:
     return None
 
 
+def _extract_usp(soup, text: str) -> Optional[str]:
+    """
+    Extract Unit Sale Price (USP) declared on e-commerce listing under Rule 6(10)/6(11).
+    e.g. '(₹0.20 / g)', '₹15.00 / 100 g', 'USP: ₹0.30 per ml', '₹1.50 / count'
+    """
+    # 1. Look in specific HTML elements/classes
+    usp_selectors = [
+        {"class_": re.compile(r"price-per-unit|unit-price|a-price-unit|UnitSalePrice", re.I)},
+        {"class_": "a-size-small a-color-price"},
+        {"attrs": {"itemprop": "unitPrice"}},
+    ]
+    for sel in usp_selectors:
+        tag = soup.find(**sel)
+        if tag:
+            t = tag.get_text(strip=True)
+            if re.search(r"(?:₹|Rs\.?|INR|\/|per)", t, re.I):
+                return t
+
+    # 2. Look for (₹... / unit) pattern in text (classic Amazon format)
+    m = re.search(r"\((?:₹|Rs\.?|INR)\s*[\d,]+(?:\.\d+)?\s*/\s*[A-Za-z0-9 ]+\)", text)
+    if m:
+        return m.group(0).strip("()")
+
+    # 3. Look for explicit USP / Unit Price pattern
+    m = re.search(r"(?:USP|Unit\s+(?:Sale\s+)?Price)[\s:]*(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d+)?)\s*(?:/|per)\s*([A-Za-z0-9 ]{1,20})", text, re.I)
+    if m:
+        return f"₹ {m.group(1)} / {m.group(2).strip()}"
+
+    # 4. Look for price per standard weight/volume/count pattern
+    m = re.search(r"(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)\s*(?:/|per)\s*(100\s*g|100\s*ml|kg|g|gm|l|lt|litre|liter|ml|count|piece|unit|pack)\b", text, re.I)
+    if m:
+        return f"₹ {m.group(1)} / {m.group(2)}"
+
+    return None
+
+
 def _extract_image_url(soup, base_url: str) -> Optional[str]:
     """
     Extract primary product packaging/photo URL.
@@ -582,6 +657,7 @@ def scrape_listing(url: str) -> dict:
         "product_title": None,
         "mrp": None,
         "net_quantity": None,
+        "usp": None,
         "manufacturer": None,
         "country_of_origin": None,
         "image_url": None,
@@ -610,13 +686,17 @@ def scrape_listing(url: str) -> dict:
 
     try:
         from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "lxml")
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            soup = BeautifulSoup(html, "html.parser")
         text = soup.get_text(separator="\n", strip=True)
 
         fields = {
             "product_title": _extract_title(soup, text),
             "mrp": _extract_mrp(soup, text, html=html),
             "net_quantity": _extract_quantity(soup, text),
+            "usp": _extract_usp(soup, text),
             "manufacturer": _extract_brand(soup, text),
             "country_of_origin": _extract_country(soup, text),
             "image_url": _extract_image_url(soup, final_url or url),

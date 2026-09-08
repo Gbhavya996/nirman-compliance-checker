@@ -14,7 +14,7 @@ Supports:
 import io
 import datetime
 import logging
-from typing import Optional
+from typing import List, Optional
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 def generate_enforcement_notice_pdf(
-    case_type: str,  # 'CASE_A' | 'CASE_B'
+    case_type: str,  # 'CASE_A' | 'CASE_B' | 'RULE_6_VIOLATION'
     product_title: Optional[str] = None,
     physical_mrp: Optional[float] = None,
     online_price: Optional[float] = None,
@@ -37,10 +37,26 @@ def generate_enforcement_notice_pdf(
     retailer_name: Optional[str] = None,
     manufacturer: Optional[str] = None,
     reference_no: Optional[str] = None,
+    breaches: Optional[List[str]] = None,
 ) -> bytes:
     """
     Generate an official statutory PDF enforcement notice.
-    Returns bytes of the PDF.
+    
+    Args:
+        case_type: The type of enforcement notice ('CASE_A', 'CASE_B', 'RULE_6_VIOLATION').
+        product_title: Name of the commodity inspected.
+        physical_mrp: MRP printed on the physical package.
+        online_price: Price observed on the digital/retail listing.
+        delta_rupees: The absolute difference in currency.
+        delta_pct: Percentage increase over allowed MRP.
+        domain_or_seller: Entity name for online violations.
+        retailer_name: Entity name for physical retail violations.
+        manufacturer: Identified manufacturer of the commodity.
+        reference_no: Unique tracking ID for the notice.
+        breaches: List of specific legal rule violations found.
+
+    Returns:
+        bytes: The raw PDF file content.
     """
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -122,6 +138,7 @@ def generate_enforcement_notice_pdf(
 
     now = datetime.datetime.now()
     date_str = now.strftime('%d-%m-%Y')
+    timestamp_str = now.strftime('%d-%m-%Y %H:%M:%S IST')
     ref_code = reference_no or f"LM-ENF/{now.year}/{now.strftime('%m%d%H%M')}"
 
     p_title = product_title or "Packaged Commodity Sample"
@@ -130,6 +147,30 @@ def generate_enforcement_notice_pdf(
     d_rup_str = f"₹ {abs(delta_rupees):.2f}" if delta_rupees is not None else "N/A"
     d_pct_str = f"{abs(delta_pct):.1f}%" if delta_pct is not None else ""
     mfg_str = manufacturer or "Not Declared / Under Investigation"
+
+    # Determine default breaches if not explicitly supplied
+    if not breaches:
+        if case_type == 'CASE_B':
+            breach_list = [
+                "Rule 18(2) LM-PC Rules (Alteration of Price / Dual MRP Tampering)",
+                "Rule 6(1)(e) LM-PC Rules (Statutory Retail Sale Price Declaration)",
+                "Section 36 & Section 48 LM Act, 2009 (Compounding of Offences)",
+            ]
+        elif case_type == 'RULE_6_VIOLATION':
+            breach_list = [
+                "Rule 6(1) LM-PC Rules (Omission of Mandatory Declarations)",
+                "Rule 6(10) LM-PC Rules (Incomplete E-Commerce Digital Disclosures)",
+                "Section 36(1) LM Act, 2009 (Penalty for Statutory Non-Compliance)",
+            ]
+        else:
+            breach_list = [
+                "Rule 18(2) LM-PC Rules (Sale above declared Maximum Retail Price)",
+                "Rule 6(1)(e) LM-PC Rules (Mandatory Maximum Retail Price)",
+                "Rule 6(10) LM-PC Rules (E-Commerce Mandatory Pricing & Disclosures)",
+                "Section 36(1) LM Act, 2009 (Penalty for Non-Compliant Retail Sale)",
+            ]
+    else:
+        breach_list = breaches
 
     story = []
 
@@ -144,12 +185,12 @@ def generate_enforcement_notice_pdf(
     # 2. Reference & Date Line
     ref_table_data = [
         [
-            Paragraph(f"<b>Ref No:</b> {ref_code}", body_style),
-            Paragraph(f"<b>Date of Inspection:</b> {date_str}", ParagraphStyle('RightText', parent=body_style, alignment=2)),
+            Paragraph(f"<b>Inspection Ref ID:</b> {ref_code}", body_style),
+            Paragraph(f"<b>Date & Timestamp:</b> {timestamp_str}", ParagraphStyle('RightText', parent=body_style, alignment=2)),
         ],
         [
             Paragraph("<b>Issuing Authority:</b> Enforcement Officer, Legal Metrology", body_style),
-            Paragraph(f"<b>Jurisdiction:</b> Central / State Metrology Wing", ParagraphStyle('RightText2', parent=body_style, alignment=2)),
+            Paragraph("<b>Jurisdiction:</b> Central / State Metrology Wing", ParagraphStyle('RightText2', parent=body_style, alignment=2)),
         ]
     ]
     ref_table = Table(ref_table_data, colWidths=[260, 255])
@@ -163,8 +204,8 @@ def generate_enforcement_notice_pdf(
 
     # 3. Addressee & Subject depending on Case A vs Case B
     if case_type == 'CASE_B':
-        recipient = retailer_name or "M/s Retail Enterprise / Store In-charge"
-        story.append(Paragraph(f"<b>TO:</b><br/>{recipient}<br/>Physical Retail Store Premise<br/>(Identified during Market Surveillance Sample Inspection)", body_style))
+        subject_entity = retailer_name or "M/s Retail Enterprise / Store In-charge"
+        story.append(Paragraph(f"<b>TO (Subject Entity):</b><br/>{subject_entity}<br/>Physical Retail Store Premise<br/>(Identified during Market Surveillance Sample Inspection)", body_style))
         story.append(Spacer(1, 8))
         story.append(Paragraph(
             "<b>SUBJECT: STATUTORY NOTICE FOR COMPOUNDING OF OFFENCE UNDER SECTION 36 & 48 OF THE LEGAL METROLOGY ACT, 2009 — "
@@ -178,9 +219,24 @@ def generate_enforcement_notice_pdf(
             "it was established that the physical sample offered for sale bears an inflated / smudged MRP exceeding the lawful maximum retail price.",
             body_style
         ))
-    else: # CASE_A default
-        platform = domain_or_seller or "E-Commerce Entity / Designated Marketplace Seller"
-        story.append(Paragraph(f"<b>TO:</b><br/>{platform}<br/>E-Commerce Marketplace Platform & Registered Entity<br/>Grievance Officer / Metrology Compliance Desk", body_style))
+    elif case_type == 'RULE_6_VIOLATION':
+        subject_entity = domain_or_seller or manufacturer or "Designated Commercial Entity / Packer"
+        story.append(Paragraph(f"<b>TO (Subject Entity):</b><br/>{subject_entity}<br/>E-Commerce Marketplace Platform / Manufacturer Premise<br/>Metrology Compliance Desk", body_style))
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(
+            "<b>SUBJECT: SHOW-CAUSE NOTICE UNDER RULE 6(1) & 6(10) OF LEGAL METROLOGY (PACKAGED COMMODITIES) RULES, 2011 "
+            "READ WITH SECTION 36 OF THE LEGAL METROLOGY ACT, 2009 — OMISSION OF MANDATORY STATUTORY DECLARATIONS.</b>",
+            subject_style
+        ))
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(
+            "WHEREAS, statutory audit and compliance examination conducted under the Legal Metrology Act, 2009 revealed that mandatory "
+            "statutory declarations mandated under Rule 6 of the LM-PC Rules, 2011 are omitted or deficient on the subject packaged commodity.",
+            body_style
+        ))
+    else:  # CASE_A default
+        subject_entity = domain_or_seller or "E-Commerce Entity / Designated Marketplace Seller"
+        story.append(Paragraph(f"<b>TO (Subject Entity):</b><br/>{subject_entity}<br/>E-Commerce Marketplace Platform & Registered Entity<br/>Grievance Officer / Metrology Compliance Desk", body_style))
         story.append(Spacer(1, 8))
         story.append(Paragraph(
             "<b>SUBJECT: SHOW-CAUSE NOTICE UNDER RULE 6(10) & 18 OF LEGAL METROLOGY (PACKAGED COMMODITIES) RULES, 2011 "
@@ -234,22 +290,18 @@ def generate_enforcement_notice_pdf(
             ),
         ],
         [
-            Paragraph("Illegal Price Margin (Delta)", table_cell_style),
-            Paragraph(f"<font color='#dc2626'><b>+{d_rup_str} ({d_pct_str})</b></font>", table_cell_style),
-            Paragraph("Section 36(1) Zero-Tolerance Overcharging Margin", table_cell_style),
+            Paragraph("Calculated Price Discrepancy", table_cell_style),
+            Paragraph(f"<font color='#dc2626'><b>+{d_rup_str} per unit ({d_pct_str})</b></font>", table_cell_style),
+            Paragraph("Section 36(1) Overcharging Margin (Delta per unit)", table_cell_style),
         ],
         [
-            Paragraph("Regulatory Violation", table_cell_style),
-            Paragraph(
-                "<b>Section 36 LM Act, 2009</b><br/>(Price Smudging / Dual MRP Tampering)" if case_type == 'CASE_B'
-                else "<b>Section 18 & 36(1) LM-PC Rules</b><br/>(Rule 6(10) E-Commerce Sale Over MRP)",
-                table_cell_style
-            ),
-            Paragraph("Contravention of Statutory Pricing Declarations", table_cell_style),
+            Paragraph("Specific Statutory Breaches", table_cell_style),
+            Paragraph("<br/>".join(f"• {b}" for b in breach_list), table_cell_style),
+            Paragraph("Contravention of Statutory Mandates under LM Act, 2009", table_cell_style),
         ],
     ]
 
-    evidence_table = Table(table_data, colWidths=[150, 180, 185])
+    evidence_table = Table(table_data, colWidths=[150, 185, 180])
     evidence_table.setStyle(TableStyle([
         ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1e3a8a')),
         ('ALIGN', (0,0), (-1,-1), 'LEFT'),
@@ -268,26 +320,17 @@ def generate_enforcement_notice_pdf(
     story.append(Paragraph("<b>STATUTORY PENALTY & DIRECTIVES</b>", subtitle_style))
     story.append(Spacer(1, 4))
 
-    if case_type == 'CASE_B':
-        penalties_text = (
-            "1. <b>Compounding Penalty Fine:</b> Under Section 36 read with Section 48 of the Legal Metrology Act, 2009, "
-            "an offense of selling commodities at a price exceeding MRP or tampering with price declarations attracts a "
-            "compounding fine of <b>₹25,000 (Twenty-Five Thousand Rupees)</b> for the first offence, extending up to "
-            "<b>₹1,00,000 (One Lakh Rupees)</b> for repeated or subsequent offences.<br/>"
-            "2. <b>Production of Records:</b> You are directed to produce your purchase invoices, stock registers, and vendor agreements "
-            "within seven (7) days of receipt of this notice before the undersigned officer.<br/>"
-            "3. <b>Compounding Option:</b> If you elect to compound this offence, submit Form LM-CP-1 along with the prescribed compounding fee."
-        )
-    else:
-        penalties_text = (
-            "1. <b>Statutory Show-Cause:</b> Under Rule 6(10) of the Legal Metrology (Packaged Commodities) Rules, 2011, "
-            "e-commerce platforms and registered sellers are strictly prohibited from quoting, billing, or selling goods above physical MRP. "
-            "You are hereby required to SHOW CAUSE in writing within <b>7 (Seven) working days</b> as to why legal proceedings under Section 36(1) "
-            "should not be initiated against your enterprise.<br/>"
-            "2. <b>Fine Bracket:</b> First offence penalty of <b>₹25,000</b>, extending up to <b>₹50,000</b> for second offence, and potential "
-            "imprisonment up to one year for continued violations.<br/>"
-            "3. <b>Immediate Corrective Action:</b> Immediately delist the non-compliant pricing and rectify listing declarations across your marketplace."
-        )
+    penalties_text = (
+        "1. <b>Statutory Compounding Fine Range (₹25,000 – ₹1,00,000):</b> Under Section 36 read with Section 48 "
+        "of the Legal Metrology Act, 2009, manufacturing, packaging, distributing, or selling commodities in "
+        "contravention of LM-PC Rules attracts a statutory compounding fine range of <b>₹25,000 (Twenty-Five Thousand Rupees)</b> "
+        "for the first offence, extending up to <b>₹50,000</b> for second offence, and up to <b>₹1,00,000 (One Lakh Rupees)</b> "
+        "for repeated or continued contraventions.<br/>"
+        "2. <b>Production of Records / Response:</b> The Subject Entity is directed to respond in writing within "
+        "<b>7 (Seven) working days</b> of receipt of this notice, presenting purchase invoices, supplier manifests, and relevant declarations.<br/>"
+        "3. <b>Compounding Option & Rectification:</b> If electing to compound this offence without court prosecution, submit Form LM-CP-1 "
+        "along with the prescribed statutory fee and immediately rectify all packaging / listing declarations."
+    )
 
     story.append(Paragraph(penalties_text, body_style))
     story.append(Spacer(1, 14))

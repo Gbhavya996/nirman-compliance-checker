@@ -41,7 +41,15 @@ class PricePerUnit(float):
 
     def __eq__(self, other):
         if isinstance(other, str):
-            return self.formatted == other or f"{float(self)}" == other or f"{float(self):.2f}" == other or f"{float(self):.3f}" == other
+            if self.formatted == other or f"{float(self)}" == other or f"{float(self):.2f}" == other or f"{float(self):.3f}" == other:
+                return True
+            m = re.search(r"(\d+(?:\.\d+)?)", other)
+            if m:
+                try:
+                    return abs(float(self) - float(m.group(1))) < 0.02
+                except ValueError:
+                    pass
+            return False
         try:
             return abs(float(self) - float(other)) < 1e-4
         except (ValueError, TypeError):
@@ -483,32 +491,32 @@ def evaluate_usp_enforcement(
       • Physical USP: Physical MRP / Physical Quantity (e.g. ₹10 / 10 ml = ₹1.00/ml)
       • Online USP: Online Price / Online Quantity (e.g. ₹150 / 180 ml = ₹0.83/ml)
     """
-    p_qty = phys_norm["value"]
-    o_qty = online_norm["value"]
+    p_qty = float(phys_norm["value"])
+    o_qty = float(online_norm["value"])
     unit = phys_norm["unit"]
     usp_unit_str = f"/{unit}"
 
-    phys_usp = physical_mrp / p_qty
-    onl_usp = online_price / o_qty
+    # Always compute USP rounded strictly to 2 decimal places:
+    # usp = round(float(price) / float(quantity_in_base_units), 2)
+    # Ensure both physical and online variants compute with identical logic so repeated runs output the exact same ₹/g or ₹/ml.
+    phys_usp = round(float(physical_mrp) / p_qty, 2)
+    onl_usp = round(float(online_price) / o_qty, 2)
 
-    # Per-gram normalization & precision formatting:
+    phys_usp_val = phys_usp
+    onl_usp_val = onl_usp
+
+    # Standardized 2-decimal precision formatting:
     if unit == "g":
-        phys_usp_val = round(phys_usp, 2)
         phys_usp_disp = f"₹ {phys_usp_val:.2f} / g"
-        onl_usp_val = round(onl_usp, 3) if onl_usp < 1.0 else round(onl_usp, 2)
-        onl_usp_disp = f"₹ {onl_usp_val:g} / g"
-        usp_diff_exact = onl_usp_val - phys_usp
-        usp_diff_3d = round(usp_diff_exact, 3)
-        if usp_diff_3d > 0:
-            usp_delta_str = f"+₹{usp_diff_3d:.3f} / g"
-        elif usp_diff_3d < 0:
-            usp_delta_str = f"-₹{abs(usp_diff_3d):.3f} / g"
+        onl_usp_disp = f"₹ {onl_usp_val:.2f} / g"
+        usp_diff = round(onl_usp - phys_usp, 2)
+        if usp_diff > 0:
+            usp_delta_str = f"+₹{usp_diff:.2f} / g"
+        elif usp_diff < 0:
+            usp_delta_str = f"-₹{abs(usp_diff):.2f} / g"
         else:
-            usp_delta_str = f"₹ 0.00 / g"
-        usp_diff = usp_diff_3d
+            usp_delta_str = "₹ 0.00 / g"
     else:
-        phys_usp_val = round(phys_usp, 2)
-        onl_usp_val = round(onl_usp, 2)
         phys_usp_disp = f"₹{phys_usp_val:.2f}{usp_unit_str}"
         onl_usp_disp = f"₹{onl_usp_val:.2f}{usp_unit_str}"
         usp_diff = round(onl_usp - phys_usp, 2)
@@ -718,16 +726,17 @@ def evaluate_variant_mismatch(
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compare(extracted_fields: dict, listing: Optional[dict] = None, is_retail_sample: bool = False) -> dict:
+def compare(extracted_fields: dict, listing: Optional[dict] = None, is_retail_sample: bool = False, has_physical_image: bool = False) -> dict:
     """
     Compare physical MRP with online price and evaluate enforcement actions under
     LM-PC Rule 18, Rule 6(11) (Unit Sale Price), and SKU Variant Mismatch Protection.
 
     Parameters
     ----------
-    extracted_fields : dict from extraction_service.extract_fields()
-    listing          : optional dict from url_scraper_service.scrape_listing()
-    is_retail_sample : bool - True if inspection is flagged as retail store physical sample
+    extracted_fields   : dict from extraction_service.extract_fields()
+    listing            : optional dict from url_scraper_service.scrape_listing()
+    is_retail_sample   : bool - True if inspection is flagged as retail store physical sample
+    has_physical_image : bool - True if a physical packaging sample image was uploaded
 
     Returns
     -------
@@ -747,6 +756,11 @@ def compare(extracted_fields: dict, listing: Optional[dict] = None, is_retail_sa
 
     phys_norm = normalize_quantity(raw_physical_qty)
     online_norm = normalize_quantity(raw_online_qty)
+
+    # Ground truth: Physical net quantity comes strictly from physical OCR extraction.
+    # Scraped online quantity must NEVER overwrite or mirror into physical fields.
+    physical_net_qty_str = phys_norm["display"] if phys_norm else "Not Detected on Image"
+    physical_qty_display = phys_norm["display"] if phys_norm else ("Not Detected on Image" if has_physical_image else None)
 
     # Context string for detergent / FMCG detection
     context_str = " ".join([
@@ -810,12 +824,14 @@ def compare(extracted_fields: dict, listing: Optional[dict] = None, is_retail_sa
     if not product_name and listing and listing.get("product_title"):
         product_name = listing["product_title"]
 
-    if physical_mrp is None and listing_price is None:
+    if physical_mrp is None and (not listing or not isinstance(listing, dict)):
         return {
             "source": "N/A",
+            "has_physical_image": has_physical_image,
             "physical_mrp": None,
             "online_price": None,
-            "physical_quantity": phys_norm["display"] if phys_norm else None,
+            "physical_quantity": physical_qty_display,
+            "physical_net_quantity": physical_net_qty_str,
             "online_quantity": online_norm["display"] if online_norm else None,
             "physical_usp": None,
             "online_usp": None,
@@ -864,9 +880,11 @@ def compare(extracted_fields: dict, listing: Optional[dict] = None, is_retail_sa
                 )
                 return {
                     "source": source_domain,
+                    "has_physical_image": has_physical_image,
                     "physical_mrp": p_mrp,
                     "online_price": l_price,
-                    "physical_quantity": phys_norm["display"] if phys_norm else None,
+                    "physical_quantity": physical_qty_display,
+                    "physical_net_quantity": physical_net_qty_str,
                     "online_quantity": online_norm["display"] if online_norm else None,
                     "physical_usp": None,
                     "online_usp": None,
@@ -936,11 +954,13 @@ def compare(extracted_fields: dict, listing: Optional[dict] = None, is_retail_sa
 
                 return {
                     "source": source_domain,
+                    "has_physical_image": has_physical_image,
                     "physical_mrp": p_mrp_obj,
                     "online_price": l_price_obj,
                     "physical_mrp_display": f"₹ {p_mrp:.2f}",
                     "online_price_display": f"₹ {l_price:.2f}",
                     "physical_quantity": phys_norm["display"],
+                    "physical_net_quantity": phys_norm["display"],
                     "online_quantity": online_norm["display"],
                     "physical_usp": p_usp_obj,
                     "online_usp": o_usp_obj,
@@ -974,9 +994,11 @@ def compare(extracted_fields: dict, listing: Optional[dict] = None, is_retail_sa
             )
             return {
                 "source": source_domain,
+                "has_physical_image": has_physical_image,
                 "physical_mrp": p_mrp,
                 "online_price": l_price,
-                "physical_quantity": None,
+                "physical_quantity": physical_qty_display,
+                "physical_net_quantity": physical_net_qty_str,
                 "online_quantity": None,
                 "physical_usp": None,
                 "online_usp": None,
@@ -1010,7 +1032,8 @@ def compare(extracted_fields: dict, listing: Optional[dict] = None, is_retail_sa
                 "source": "N/A",
                 "physical_mrp": physical_mrp,
                 "online_price": None,
-                "physical_quantity": phys_norm["display"] if phys_norm else None,
+                "physical_quantity": physical_qty_display,
+                "physical_net_quantity": physical_net_qty_str,
                 "online_quantity": None,
                 "physical_usp": None,
                 "online_usp": None,
@@ -1039,7 +1062,8 @@ def compare(extracted_fields: dict, listing: Optional[dict] = None, is_retail_sa
                 enf = evaluate_enforcement(p_mrp, op, is_retail_sample, "Open Food Facts")
                 live_result.update({
                     "physical_mrp": p_mrp,
-                    "physical_quantity": phys_norm["display"] if phys_norm else None,
+                    "physical_quantity": physical_qty_display,
+                    "physical_net_quantity": physical_net_qty_str,
                     "online_quantity": None,
                     "physical_usp": None,
                     "online_usp": None,
@@ -1065,9 +1089,11 @@ def compare(extracted_fields: dict, listing: Optional[dict] = None, is_retail_sa
 
         return {
             "source": "N/A",
+            "has_physical_image": has_physical_image,
             "physical_mrp": p_mrp,
             "online_price": None,
-            "physical_quantity": phys_norm["display"] if phys_norm else None,
+            "physical_quantity": physical_qty_display,
+            "physical_net_quantity": physical_net_qty_str,
             "online_quantity": None,
             "physical_usp": None,
             "online_usp": None,
@@ -1088,75 +1114,171 @@ def compare(extracted_fields: dict, listing: Optional[dict] = None, is_retail_sa
             "cases": None,
         }
 
-    # Only listing price is available (no physical label)
-    try:
-        listing_price = float(listing_price)
-        source_domain = (listing or {}).get("domain") or "Online Listing"
-        case_match = {
-            "case": "CASE_A",
-            "case_name": "Online Fraud (Over-MRP Sale on E-Commerce)",
-            "is_violation": False,
-            "status": "PASS",
-            "verdict": "RULE 18 COMPLIANT - Online listing strictly matches packaging MRP.",
-            "delta_rupees": 0.0,
-            "delta_pct": 0.0,
-            "delta_str": "₹ 0.00",
-            "action": None,
-            "notice_type": None,
-            "notice_button_label": None,
-            "penalty_bracket": None,
-            "explanation": f"Online price ₹{listing_price:.2f} verified on {source_domain}.",
-        }
-        return {
-            "source": source_domain,
-            "physical_mrp": listing_price,
-            "online_price": listing_price,
-            "physical_quantity": None,
-            "online_quantity": online_norm["display"] if online_norm else None,
-            "physical_usp": None,
-            "online_usp": None,
-            "usp_unit": None,
-            "usp_comparison": None,
-            "quantities_match": None,
-            "is_variant_mismatch": False,
-            "delta_pct": 0.0,
-            "delta_rupees": 0.0,
-            "delta_str": "₹ 0.00",
-            "status": "PASS",
-            "verdict": "RULE 18 COMPLIANT - Online listing strictly matches packaging MRP.",
-            "action": None,
-            "notice_type": None,
-            "notice_button_label": None,
-            "penalty_bracket": None,
-            "explanation": f"Price ₹{listing_price:.2f} verified on {source_domain}.",
-            "is_retail_sample": is_retail_sample,
-            "cases": {
-                "case_a": case_match,
-                "case_b": {**case_match, "case": "CASE_B", "case_name": "Offline Fraud / Tampering (Retail Store Physical Sample)"},
-            },
-        }
-    except (TypeError, ValueError):
-        return {
-            "source": "N/A",
-            "physical_mrp": None,
-            "online_price": None,
-            "physical_quantity": None,
-            "online_quantity": None,
-            "physical_usp": None,
-            "online_usp": None,
-            "usp_unit": None,
-            "usp_comparison": None,
-            "quantities_match": None,
-            "is_variant_mismatch": False,
-            "delta_pct": None,
-            "delta_rupees": None,
-            "status": "SKIP",
-            "verdict": "NO PRICING AVAILABLE",
-            "action": None,
-            "notice_type": None,
-            "notice_button_label": None,
-            "penalty_bracket": None,
-            "explanation": "No valid pricing available for comparison.",
-            "is_retail_sample": is_retail_sample,
-            "cases": None,
-        }
+    # URL-Only Audit or Missing Physical Label (physical_mrp is None)
+    # Evaluate digital compliance under Legal Metrology Rule 6(10) (E-Commerce Mandatory Disclosures)
+    source_domain = (listing or {}).get("domain") or "Online Listing"
+
+    # 1. Price check
+    l_price = None
+    has_price = False
+    if listing_price is not None:
+        try:
+            l_price = float(listing_price)
+            if l_price > 0:
+                has_price = True
+        except (ValueError, TypeError):
+            l_price = None
+
+    # 2. Net Quantity check
+    has_quantity = bool(online_norm is not None or (listing and listing.get("net_quantity")))
+
+    # 3. USP check (Unit Sale Price declared on listing or found in page text)
+    listing_usp = (listing or {}).get("usp")
+    if not listing_usp and listing and listing.get("page_text"):
+        page_txt = listing.get("page_text") or ""
+        m_usp = re.search(r"\((?:₹|Rs\.?|INR)\s*[\d,]+(?:\.\d+)?\s*/\s*[^)]+\)", page_txt)
+        if m_usp:
+            listing_usp = m_usp.group(0).strip("()")
+        else:
+            m_usp2 = re.search(
+                r"(?:USP|Unit\s+(?:Sale\s+)?Price)[\s:]*(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d+)?)\s*(?:/|per)\s*([A-Za-z0-9 ]{1,20})",
+                page_txt,
+                re.I,
+            )
+            if m_usp2:
+                listing_usp = f"₹ {m_usp2.group(1)} / {m_usp2.group(2).strip()}"
+            else:
+                m_usp3 = re.search(
+                    r"(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)\s*(?:/|per)\s*(?:100\s*g|100\s*ml|kg|g|gm|l|lt|litre|liter|ml|count|piece|unit|pack)\b",
+                    page_txt,
+                    re.I,
+                )
+                if m_usp3:
+                    listing_usp = f"₹ {m_usp3.group(1)} / {m_usp3.group(2)}"
+
+    has_usp = bool(listing_usp)
+
+    # 4. Country of Origin check
+    has_country = bool(listing and listing.get("country_of_origin"))
+
+    # Derive online USP for display if calculable
+    online_usp_val = None
+    online_usp_disp = str(listing_usp) if listing_usp else None
+    if l_price and online_norm and online_norm.get("value"):
+        u = "g" if online_norm["unit_type"] == "weight" else ("ml" if online_norm["unit_type"] == "volume" else online_norm["unit"])
+        val_in_u = online_norm["value"]
+        if val_in_u > 0:
+            online_usp_val = round(l_price / val_in_u, 2)
+            if not online_usp_disp:
+                online_usp_disp = f"₹ {online_usp_val:.2f} / {u}"
+
+    # 0. Title check
+    has_title = bool(listing and (listing.get("product_title") or listing.get("title")))
+
+    missing_disclosures = []
+    if not has_title:
+        missing_disclosures.append("Title")
+    if not has_price:
+        missing_disclosures.append("Price")
+    if not has_quantity:
+        missing_disclosures.append("Net Quantity")
+    if not has_country:
+        missing_disclosures.append("Country of Origin")
+    if not has_usp:
+        missing_disclosures.append("USP")
+
+    if missing_disclosures:
+        verdict = "Rule 6(10) Violation - Incomplete statutory disclosures on e-commerce listing"
+        status = "FAIL"
+        is_violation = True
+        explanation = f"E-Commerce listing on {source_domain} violates Legal Metrology Rule 6(10). Missing mandatory statutory disclosures: {', '.join(missing_disclosures)}."
+        action = "Issue Statutory Notice to E-Commerce Platform / Seller under Rule 6(10) for incomplete digital disclosures."
+        penalty_bracket = "Section 36 compounding fine range of ₹25,000 to ₹1,00,000 under Rule 6(10) show-cause"
+        notice_type = "PLATFORM_SHOW_CAUSE"
+        notice_button_label = "📄 Download Platform Show-Cause Notice (Rule 6(10))"
+    elif has_physical_image and not physical_mrp:
+        verdict = "PHYSICAL MRP NOT DETECTED ON SAMPLE (RULE 6(1)(e) BREACH)"
+        status = "PHYSICAL_MRP_MISSING"
+        is_violation = False
+        explanation = f"Physical packaging sample image was uploaded, but Maximum Retail Price (MRP) declaration was not detected on the label. Mandatory under Rule 6(1)(e)."
+        action = "Inspect physical packaging sample for missing or obscured MRP declaration."
+        penalty_bracket = None
+        notice_type = None
+        notice_button_label = None
+    else:
+        verdict = "E-Commerce Declarations Available (Pending Physical Ground Truth Verification)"
+        status = "Physical Sample Required for Comparison"
+        is_violation = False
+        explanation = f"All mandatory online disclosures under Rule 6(10) (Title, Price, Net Quantity, USP, and Country of Origin) are present on {source_domain}. Physical packaging sample image is required to compare physical MRP against online price."
+        action = "Upload physical packaging sample image to run OCR label verification and price cross-comparison."
+        penalty_bracket = None
+        notice_type = None
+        notice_button_label = None
+
+    case_a = {
+        "case": "CASE_A",
+        "case_name": "E-Commerce Mandatory Disclosures (Rule 6(10))",
+        "is_violation": is_violation,
+        "status": status,
+        "verdict": verdict,
+        "delta_rupees": None,
+        "delta_pct": None,
+        "delta_str": "N/A",
+        "action": action,
+        "notice_type": notice_type,
+        "notice_button_label": notice_button_label,
+        "penalty_bracket": penalty_bracket,
+        "explanation": explanation,
+    }
+    case_b = {
+        "case": "CASE_B",
+        "case_name": "Offline Fraud / Tampering (Retail Store Physical Sample)",
+        "is_violation": False,
+        "status": "PHYSICAL_MRP_MISSING" if has_physical_image else "SAMPLE_REQUIRED",
+        "verdict": "PHYSICAL MRP NOT DETECTED ON SAMPLE" if has_physical_image else "PHYSICAL SAMPLE REQUIRED FOR COMPARISON",
+        "delta_rupees": None,
+        "delta_pct": None,
+        "delta_str": "N/A",
+        "action": "Inspect physical sample for legible MRP declaration." if has_physical_image else "Upload retail store physical packaging sample image.",
+        "notice_type": None,
+        "notice_button_label": None,
+        "penalty_bracket": None,
+        "explanation": "No physical retail sample uploaded for comparison.",
+    }
+
+    return {
+        "source": source_domain,
+        "has_physical_image": has_physical_image,
+        "physical_mrp": None,
+        "online_price": l_price,
+        "physical_mrp_display": None,
+        "online_price_display": f"₹ {l_price:.2f}" if l_price is not None else "—",
+        "physical_quantity": "Not Detected on Image" if has_physical_image else None,
+        "physical_net_quantity": "Not Detected on Image",
+        "online_quantity": online_norm["display"] if online_norm else ((listing or {}).get("net_quantity") or None),
+        "physical_usp": None,
+        "online_usp": online_usp_val,
+        "physical_usp_display": None,
+        "online_usp_display": online_usp_disp,
+        "usp_unit": online_norm["unit"] if online_norm else None,
+        "usp_comparison": "N/A",
+        "quantities_match": None,
+        "is_variant_mismatch": False,
+        "delta_pct": None,
+        "delta_rupees": None,
+        "delta_str": "N/A",
+        "status": status,
+        "verdict": verdict,
+        "is_violation": is_violation,
+        "case": "CASE_A",
+        "action": action,
+        "notice_type": notice_type,
+        "notice_button_label": notice_button_label,
+        "penalty_bracket": penalty_bracket,
+        "explanation": explanation,
+        "is_retail_sample": is_retail_sample,
+        "cases": {
+            "case_a": case_a,
+            "case_b": case_b,
+        },
+    }

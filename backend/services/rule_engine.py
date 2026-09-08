@@ -24,7 +24,7 @@ WARNING – field present but may be non-compliant (needs human review)
 
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -326,6 +326,112 @@ def _check_fssai(field: dict) -> RuleResult:
     }
 
 
+def _check_usp_mathematical_integrity(extracted_fields: dict) -> Optional[RuleResult]:
+    """
+    Rule 6(11) Mathematical Integrity Check:
+    If both physical_mrp and physical_net_quantity exist:
+      - Compute expected USP: mrp / quantity.
+      - If declared USP differs by > 5% from computed USP, flag warning:
+        "Rule 6(11) Mismatch: Declared USP does not match computed unit rate."
+    """
+    mrp_field = extracted_fields.get("mrp", {})
+    qty_field = extracted_fields.get("net_quantity", {})
+    usp_field = extracted_fields.get("usp") or extracted_fields.get("unit_sale_price", {})
+
+    if not mrp_field.get("found") or mrp_field.get("value") is None:
+        return None
+    if not qty_field.get("found") or qty_field.get("value") is None:
+        return None
+
+    # Parse MRP
+    try:
+        mrp_val = float(mrp_field["value"])
+    except (ValueError, TypeError):
+        return None
+
+    # Parse Quantity value and unit
+    qty_str = str(qty_field["value"]).strip()
+    m_qty = re.search(r"(\d+(?:\.\d+)?)\s*(kg|g|gm|gms|ml|l|ltr)", qty_str, re.IGNORECASE)
+    if not m_qty:
+        return None
+
+    qty_val = float(m_qty.group(1))
+    qty_unit = m_qty.group(2).lower()
+    if qty_val <= 0:
+        return None
+
+    # Standardize unit to base metric: g or ml
+    if qty_unit in ("g", "gm", "gms"):
+        base_qty = qty_val
+        base_unit = "g"
+    elif qty_unit in ("kg", "kgs"):
+        base_qty = qty_val * 1000.0
+        base_unit = "g"
+    elif qty_unit in ("l", "ltr"):
+        base_qty = qty_val * 1000.0
+        base_unit = "ml"
+    elif qty_unit == "ml":
+        base_qty = qty_val
+        base_unit = "ml"
+    else:
+        base_qty = qty_val
+        base_unit = qty_unit
+
+    computed_usp_per_base = round(float(mrp_val) / float(base_qty), 2)
+
+    # Check if declared USP exists
+    if not usp_field.get("found") or usp_field.get("value") is None:
+        return None
+
+    # Parse declared USP value
+    usp_str = str(usp_field["value"]).replace("₹", "").replace("Rs.", "").strip()
+    m_usp = re.search(r"(\d+(?:\.\d+)?)\s*(?:per|\/)\s*([a-z]+)", usp_str, re.IGNORECASE)
+    if not m_usp:
+        try:
+            m_single = re.search(r"\d+(?:\.\d+)?", usp_str)
+            if not m_single:
+                return None
+            declared_rate = float(m_single.group(0))
+            declared_unit = base_unit
+        except Exception:
+            return None
+    else:
+        declared_rate = float(m_usp.group(1))
+        declared_unit = m_usp.group(2).lower()
+
+    # Convert declared rate to same base unit
+    if declared_unit in ("kg", "l"):
+        declared_rate_per_base = declared_rate / 1000.0
+    elif declared_unit in ("g", "gm", "gms", "ml"):
+        declared_rate_per_base = declared_rate
+    else:
+        declared_rate_per_base = declared_rate
+
+    # Calculate percentage discrepancy: abs(declared - computed) / computed
+    diff_pct = abs(declared_rate_per_base - computed_usp_per_base) / computed_usp_per_base
+
+    if diff_pct > 0.05:  # > 5% mismatch
+        return {
+            "field": "Unit Sale Price (USP)",
+            "status": "WARNING",
+            "rule_ref": "LM-PC Rule 6(11)",
+            "explanation": "Rule 6(11) Mismatch: Declared USP does not match computed unit rate.",
+            "value": usp_field.get("value"),
+            "diff_pct": round(diff_pct * 100, 2),
+            "expected_usp": f"₹{computed_usp_per_base:.2f}/{base_unit}",
+        }
+
+    return {
+        "field": "Unit Sale Price (USP)",
+        "status": "PASS",
+        "rule_ref": "LM-PC Rule 6(11)",
+        "explanation": (
+            f"Declared USP aligns with computed unit rate (₹{computed_usp_per_base:.2f}/{base_unit}) within 5% tolerance."
+        ),
+        "value": usp_field.get("value"),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -353,6 +459,11 @@ def evaluate(extracted_fields: dict, raw_text: str) -> RuleReport:
     report.append(_check_manufacturer(extracted_fields.get("manufacturer", {"found": False})))
     report.append(_check_country(extracted_fields.get("country_of_origin", {"found": False})))
     report.append(_check_fssai(extracted_fields.get("fssai_licence", {"found": False})))
+
+    # Rule 6(11) mathematical integrity check between declared USP and MRP / Net Quantity
+    usp_check = _check_usp_mathematical_integrity(extracted_fields)
+    if usp_check is not None:
+        report.append(usp_check)
 
     return report
 

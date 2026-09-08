@@ -1,6 +1,7 @@
-
 backend/venv/
 venv/
+.venv/
 node_modules/
 backend/nirman_history.db
+backend/uploads/
 __pycache__/
